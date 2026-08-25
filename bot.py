@@ -1,12 +1,11 @@
-import time, requests
+import time, requests, os, threading
 from flask import Flask
-import os
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot Running 24/7 - No Telegram Needed"
+    return "Bot is Running 24/7 LIVE - BTC Price Bot"
 
 def get_price():
     try:
@@ -18,12 +17,10 @@ def get_price():
 def bot_loop():
     while True:
         price = get_price()
-        print(f"BTC Price: {price}")
-        # YOUR BUY/SELL LOGIC WILL RUN HERE
+        print(f"BTC Price: {price} - Bot Working", flush=True)
         time.sleep(60)
 
-# Start bot in background
-import threading
 threading.Thread(target=bot_loop, daemon=True).start()
 
-app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
