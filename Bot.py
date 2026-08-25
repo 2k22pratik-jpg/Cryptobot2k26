@@ -1,25 +1,29 @@
-import os, time, requests
-from datetime import datetime
+import time, requests
+from flask import Flask
+import os
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+app = Flask(__name__)
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+@app.route('/')
+def home():
+    return "Bot Running 24/7 - No Telegram Needed"
 
 def get_price():
-    data = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").json()
-    return float(data['price'])
-
-send_telegram("✅ Bot Started\nBTCUSDT 15m\nPaper Trading\nCloud 24/7 LIVE")
-
-while True:
     try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=10).json()
+        return float(r['price'])
+    except:
+        return 0
+
+def bot_loop():
+    while True:
         price = get_price()
-        print(f"{datetime.now()} Price: {price}")
-        # Your RSI/MACD logic here - for now just heartbeat every 30 min
+        print(f"BTC Price: {price}")
+        # YOUR BUY/SELL LOGIC WILL RUN HERE
         time.sleep(60)
-    except Exception as e:
-        print(e)
-        time.sleep(10)
+
+# Start bot in background
+import threading
+threading.Thread(target=bot_loop, daemon=True).start()
+
+app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
