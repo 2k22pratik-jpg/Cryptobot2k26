@@ -1,1162 +1,209 @@
-import os
-import time
-import threading
-import traceback
-from datetime import datetime, timezone
-
-import requests
-import numpy as np
-import pandas as pd
-from flask import Flask, jsonify
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-SYMBOL = "BTCUSDT"
-
-ENTRY_TIMEFRAME = "5m"
-TREND_TIMEFRAME = "15m"
-
-INITIAL_BALANCE = 1000.0
-
-RISK_PER_TRADE = 0.005       # 0.5%
-MAX_TRADES_PER_DAY = 4
-MAX_DAILY_LOSS = 0.02        # 2%
-MAX_CONSECUTIVE_LOSSES = 3
-
-MIN_SIGNAL_SCORE = 7
-
-ADX_MIN = 18
-
-ATR_SL_MULTIPLIER = 1.2
-ATR_TRAILING_MULTIPLIER = 1.0
-
-TAKE_PROFIT_R = 2.0
-
-COOLDOWN_CANDLES = 3
-
-POLL_SECONDS = 20
-
-BINANCE_API = "https://api.binance.com"
-
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-)
-
-
-# ============================================================
-# FLASK SERVER FOR RENDER
-# ============================================================
+import time, requests, os, threading
+from flask import Flask
+from datetime import datetime, date
 
 app = Flask(__name__)
 
+SYMBOL = "BTCUSDT"
+RISK_PCT = 0.005
+ATR_SL_MULT = 1.2
+MAX_TRADES_DAY = 4
+MAX_CONSEC_LOSS = 3
+MAX_DAILY_LOSS_PCT = 0.02
+COOLDOWN_CANDLES = 3
 
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "running",
-        "bot": "BTCUSDT Advanced Paper Trading Bot",
-        "mode": "PAPER TRADING ONLY",
-        "symbol": SYMBOL
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "healthy"
-    }), 200
-
-
-# ============================================================
-# GLOBAL BOT STATE
-# ============================================================
-
-balance = INITIAL_BALANCE
-
-open_trade = None
-
+balance = 1000.0
+initial_balance = 1000.0
+position = None
+trades_today = 0
+consec_losses = 0
+daily_loss = 0.0
+last_trade_date = date.today()
+cooldown = 0
+last_signal = "Starting..."
+score_breakdown = ""
+current_price = 0.0
+indicators = {}
 trade_history = []
 
-daily_trade_count = 0
-
-consecutive_losses = 0
-
-daily_start_balance = INITIAL_BALANCE
-
-last_processed_candle = None
-
-last_trade_candle = None
-
-bot_started_at = datetime.now(timezone.utc)
-
-state_lock = threading.Lock()
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(message):
-
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    print(
-        f"[{timestamp}] {message}",
-        flush=True
-    )
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-
-        log("Telegram not configured.")
-
-        return
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
-
+def get_klines(interval, limit=100):
     try:
-
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=10
-        )
-
-        if not response.ok:
-
-            log(
-                "Telegram error: "
-                f"{response.text[:300]}"
-            )
-
-    except Exception as e:
-
-        log(
-            f"Telegram connection error: {e}"
-        )
-
-
-# ============================================================
-# BINANCE MARKET DATA
-# ============================================================
-
-def get_klines(
-    symbol,
-    interval,
-    limit=500
-):
-
-    url = f"{BINANCE_API}/api/v3/klines"
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=20
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-        "ignore"
-    ]
-
-    df = pd.DataFrame(
-        data,
-        columns=columns
-    )
-
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
-    ]
-
-    for column in numeric_columns:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms",
-        utc=True
-    )
-
-    df["close_time"] = pd.to_datetime(
-        df["close_time"],
-        unit="ms",
-        utc=True
-    )
-
-    return df
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def add_indicators(df):
-
-    df = df.copy()
-
-    # --------------------------------------------------------
-    # EMA
-    # --------------------------------------------------------
-
-    df["ema20"] = (
-        df["close"]
-        .ewm(
-            span=20,
-            adjust=False
-        )
-        .mean()
-    )
-
-    df["ema50"] = (
-        df["close"]
-        .ewm(
-            span=50,
-            adjust=False
-        )
-        .mean()
-    )
-
-    df["ema200"] = (
-        df["close"]
-        .ewm(
-            span=200,
-            adjust=False
-        )
-        .mean()
-    )
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    delta = df["close"].diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = gain.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
-    )
-
-    df["rsi"] = (
-        100 -
-        (
-            100 /
-            (1 + rs)
-        )
-    )
-
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
-
-    previous_close = df["close"].shift(1)
-
-    tr1 = (
-        df["high"] -
-        df["low"]
-    )
-
-    tr2 = (
-        df["high"] -
-        previous_close
-    ).abs()
-
-    tr3 = (
-        df["low"] -
-        previous_close
-    ).abs()
-
-    true_range = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3
-        ],
-        axis=1
-    ).max(axis=1)
-
-    df["atr"] = (
-        true_range
-        .rolling(14)
-        .mean()
-    )
-
-    # --------------------------------------------------------
-    # ADX
-    # --------------------------------------------------------
-
-    up_move = (
-        df["high"].diff()
-    )
-
-    down_move = (
-        -df["low"].diff()
-    )
-
-    plus_dm = pd.Series(
-        np.where(
-            (
-                up_move > down_move
-            ) &
-            (
-                up_move > 0
-            ),
-            up_move,
-            0
-        ),
-        index=df.index
-    )
-
-    minus_dm = pd.Series(
-        np.where(
-            (
-                down_move > up_move
-            ) &
-            (
-                down_move > 0
-            ),
-            down_move,
-            0
-        ),
-        index=df.index
-    )
-
-    atr14 = (
-        true_range
-        .rolling(14)
-        .mean()
-    )
-
-    plus_di = (
-        100 *
-        plus_dm
-        .rolling(14)
-        .mean() /
-        atr14
-    )
-
-    minus_di = (
-        100 *
-        minus_dm
-        .rolling(14)
-        .mean() /
-        atr14
-    )
-
-    denominator = (
-        plus_di +
-        minus_di
-    )
-
-    dx = (
-        100 *
-        (plus_di - minus_di).abs() /
-        denominator.replace(
-            0,
-            np.nan
-        )
-    )
-
-    df["adx"] = (
-        dx
-        .rolling(14)
-        .mean()
-    )
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
-
-    df["volume_sma"] = (
-        df["volume"]
-        .rolling(20)
-        .mean()
-    )
-
-    return df
-
-
-# ============================================================
-# TREND REGIME
-# ============================================================
-
-def bullish_regime(df):
-
-    if len(df) < 205:
-        return False
-
-    current = df.iloc[-2]
-
-    previous = df.iloc[-3]
-
-    values = [
-        current["close"],
-        current["ema50"],
-        current["ema200"],
-        current["adx"],
-        previous["ema50"]
-    ]
-
-    if any(
-        pd.isna(x)
-        for x in values
-    ):
-        return False
-
-    return (
-        current["close"] >
-        current["ema200"]
-
-        and
-
-        current["ema50"] >
-        current["ema200"]
-
-        and
-
-        current["adx"] >
-        ADX_MIN
-
-        and
-
-        current["ema50"] >
-        previous["ema50"]
-    )
-
-
-def bearish_regime(df):
-
-    if len(df) < 205:
-        return False
-
-    current = df.iloc[-2]
-
-    previous = df.iloc[-3]
-
-    values = [
-        current["close"],
-        current["ema50"],
-        current["ema200"],
-        current["adx"],
-        previous["ema50"]
-    ]
-
-    if any(
-        pd.isna(x)
-        for x in values
-    ):
-        return False
-
-    return (
-        current["close"] <
-        current["ema200"]
-
-        and
-
-        current["ema50"] <
-        current["ema200"]
-
-        and
-
-        current["adx"] >
-        ADX_MIN
-
-        and
-
-        current["ema50"] <
-        previous["ema50"]
-    )
-
-
-# ============================================================
-# MARKET STRUCTURE
-# ============================================================
-
-def bullish_structure(df):
-
-    if len(df) < 5:
-        return False
-
-    current = df.iloc[-2]
-
-    previous = df.iloc[-3]
-
-    return (
-        current["low"] >
-        previous["low"]
-    )
-
-
-def bearish_structure(df):
-
-    if len(df) < 5:
-        return False
-
-    current = df.iloc[-2]
-
-    previous = df.iloc[-3]
-
-    return (
-        current["high"] <
-        previous["high"]
-    )
-
-
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
-
-def generate_signal(
-    df5,
-    df15
-):
-
-    if len(df5) < 205:
-        return None
-
-    if len(df15) < 205:
-        return None
-
-    current = df5.iloc[-2]
-
-    previous = df5.iloc[-3]
-
-    long_score = 0
-    short_score = 0
-
-    long_reasons = []
-    short_reasons = []
-
-    # ========================================================
-    # LONG
-    # ========================================================
-
-    if bullish_regime(df15):
-
-        long_score += 2
-
-        long_reasons.append(
-            "15m bullish regime"
-        )
-
-        if (
-            current["ema20"] >
-            current["ema50"]
-        ):
-
-            long_score += 1
-
-            long_reasons.append(
-                "EMA alignment"
-            )
-
-        # Pullback
-        if not pd.isna(
-            current["atr"]
-        ):
-
-            distance = abs(
-                current["close"] -
-                current["ema20"]
-            )
-
-            if distance <= (
-                1.5 *
-                current["atr"]
-            ):
-
-                long_score += 1
-
-                long_reasons.append(
-                    "EMA pullback"
-                )
-
-        # RSI
-        if (
-            45 <=
-            current["rsi"] <=
-            65
-        ):
-
-            long_score += 1
-
-            long_reasons.append(
-                "RSI confirmation"
-            )
-
-        # Volume
-        if (
-            current["volume"] >
-            current["volume_sma"] *
-            1.05
-        ):
-
-            long_score += 1
-
-            long_reasons.append(
-                "volume confirmation"
-            )
-
-        # Higher low
-        if bullish_structure(df5):
-
-            long_score += 2
-
-            long_reasons.append(
-                "higher-low structure"
-            )
-
-        # Break previous high
-        if (
-            current["high"] >
-            previous["high"]
-        ):
-
-            long_score += 1
-
-            long_reasons.append(
-                "breakout confirmation"
-            )
-
-    # ========================================================
-    # SHORT
-    # ========================================================
-
-    if bearish_regime(df15):
-
-        short_score += 2
-
-        short_reasons.append(
-            "15m bearish regime"
-        )
-
-        if (
-            current["ema20"] <
-            current["ema50"]
-        ):
-
-            short_score += 1
-
-            short_reasons.append(
-                "EMA alignment"
-            )
-
-        if not pd.isna(
-            current["atr"]
-        ):
-
-            distance = abs(
-                current["close"] -
-                current["ema20"]
-            )
-
-            if distance <= (
-                1.5 *
-                current["atr"]
-            ):
-
-                short_score += 1
-
-                short_reasons.append(
-                    "EMA pullback"
-                )
-
-        if (
-            35 <=
-            current["rsi"] <=
-            55
-        ):
-
-            short_score += 1
-
-            short_reasons.append(
-                "RSI confirmation"
-            )
-
-        if (
-            current["volume"] >
-            current["volume_sma"] *
-            1.05
-        ):
-
-            short_score += 1
-
-            short_reasons.append(
-                "volume confirmation"
-            )
-
-        if bearish_structure(df5):
-
-            short_score += 2
-
-            short_reasons.append(
-                "lower-high structure"
-            )
-
-        if (
-            current["low"] <
-            previous["low"]
-        ):
-
-            short_score += 1
-
-            short_reasons.append(
-                "breakdown confirmation"
-            )
-
-    # ========================================================
-    # SELECT BEST SIGNAL
-    # ========================================================
-
-    if (
-        long_score >= MIN_SIGNAL_SCORE
-        and
-        long_score >= short_score
-    ):
-
-        return {
-            "side": "LONG",
-            "score": long_score,
-            "reasons": long_reasons,
-            "candle": current
-        }
-
-    if (
-        short_score >= MIN_SIGNAL_SCORE
-        and
-        short_score > long_score
-    ):
-
-        return {
-            "side": "SHORT",
-            "score": short_score,
-            "reasons": short_reasons,
-            "candle": current
-        }
-
-    return None
-
-
-# ============================================================
-# POSITION SIZE
-# ============================================================
-
-def calculate_position_size(
-    entry,
-    stop
-):
-
-    risk_amount = (
-        balance *
-        RISK_PER_TRADE
-    )
-
-    stop_distance = abs(
-        entry - stop
-    )
-
-    if (
-        stop_distance <= 0
-        or
-        not np.isfinite(
-            stop_distance
-        )
-    ):
-
-        return 0
-
-    return (
-        risk_amount /
-        stop_distance
-    )
-
-
-# ============================================================
-# OPEN PAPER TRADE
-# ============================================================
-
-def open_trade_from_signal(
-    signal
-):
-
-    global open_trade
-    global daily_trade_count
-    global last_trade_candle
-
-    candle = signal["candle"]
-
-    entry = float(
-        candle["close"]
-    )
-
-    atr = float(
-        candle["atr"]
-    )
-
-    if (
-        not np.isfinite(atr)
-        or
-        atr <= 0
-    ):
-
-        return
-
-    side = signal["side"]
-
-    if side == "LONG":
-
-        stop = (
-            entry -
-            ATR_SL_MULTIPLIER *
-            atr
-        )
-
-        risk = (
-            entry -
-            stop
-        )
-
-        target = (
-            entry +
-            TAKE_PROFIT_R *
-            risk
-        )
-
-    else:
-
-        stop = (
-            entry +
-            ATR_SL_MULTIPLIER *
-            atr
-        )
-
-        risk = (
-            stop -
-            entry
-        )
-
-        target = (
-            entry -
-            TAKE_PROFIT_R *
-            risk
-        )
-
-    quantity = calculate_position_size(
-        entry,
-        stop
-    )
-
-    if quantity <= 0:
-        return
-
-    open_trade = {
-
-        "side": side,
-
-        "entry": entry,
-
-        "stop": stop,
-
-        "original_stop": stop,
-
-        "target": target,
-
-        "risk": risk,
-
-        "quantity": quantity,
-
-        "score": signal["score"],
-
-        "reasons": signal["reasons"],
-
-        "entry_time": candle[
-            "open_time"
-        ],
-
-        "breakeven": False,
-
-        "trailing": False
-    }
-
-    daily_trade_count += 1
-
-    last_trade_candle = candle[
-        "open_time"
-    ]
-
-    message = (
-        "🚨 PAPER TRADE\n\n"
-        f"BTCUSDT\n\n"
-        f"Signal: {side}\n\n"
-        f"Entry: {entry:.2f}\n"
-        f"Stop Loss: {stop:.2f}\n"
-        f"Take Profit: {target:.2f}\n\n"
-        f"Risk: {RISK_PER_TRADE * 100:.2f}%\n"
-        f"Score: {signal['score']}/9\n\n"
-        "Reasons:\n"
-        +
-        "\n".join(
-            f"• {x}"
-            for x in signal["reasons"]
-        )
-        +
-        "\n\n⚠️ PAPER ONLY"
-    )
-
-    log(message)
-
-    send_telegram(message)
-
-
-# ============================================================
-# CLOSE TRADE
-# ============================================================
-
-def close_trade(
-    exit_price,
-    reason
-):
-
-    global open_trade
-    global balance
-    global consecutive_losses
-
-    if open_trade is None:
-        return
-
-    side = open_trade["side"]
-
-    entry = open_trade["entry"]
-
-    quantity = open_trade["quantity"]
-
-    if side == "LONG":
-
-        pnl = (
-            exit_price -
-            entry
-        ) * quantity
-
-    else:
-
-        pnl = (
-            entry -
-            exit_price
-        ) * quantity
-
-    balance += pnl
-
-    if pnl < 0:
-
-        consecutive_losses += 1
-
-    else:
-
-        consecutive_losses = 0
-
-    trade = {
-        "side": side,
-        "entry": entry,
-        "exit": exit_price,
-        "reason": reason,
-        "pnl": pnl,
-        "balance": balance,
-        "time": datetime.now(
-            timezone.utc
-        )
-    }
-
-    trade_history.append(
-        trade
-    )
-
-    message = (
-        "📊 PAPER TRADE CLOSED\n\n"
-        f"BTCUSDT\n"
-        f"Side: {side}\n"
-        f"Exit reason: {reason}\n\n"
-        f"Entry: {entry:.2f}\n"
-        f"Exit: {exit_price:.2f}\n"
-        f"P/L: {pnl:+.2f} USDT\n"
-        f"Balance: {balance:.2f} USDT\n\n"
-        f"Consecutive losses: "
-        f"{consecutive_losses}"
-    )
-
-    log(message)
-
-    send_telegram(message)
-
-    open_trade = None
-
-
-# ============================================================
-# MANAGE OPEN TRADE
-# ============================================================
-
-def manage_open_trade(
-    candle
-):
-
-    if open_trade is None:
-        return
-
-    high = float(
-        candle["high"]
-    )
-
-    low = float(
-        candle["low"]
-    )
-
-    close = float(
-        candle["close"]
-    )
-
-    atr = float(
-        candle["atr"]
-    )
-
-    side = open_trade["side"]
-
-    entry = open_trade["entry"]
-
-    stop = open_trade["stop"]
-
-    target = open_trade["target"]
-
-    risk = open_trade["risk"]
-
-    # ========================================================
-    # LONG
-    # ========================================================
-
-    if side == "LONG":
-
-        # Stop
-        if low <= stop:
-
-            close_trade(
-                stop,
-                "STOP LOSS"
-            )
-
-            return
-
-        # Breakeven at +1R
-        if (
-            not open_trade["breakeven"]
-            and
-            high >= (
-                entry +
-                risk
-            )
-        ):
-
-            open_trade["stop"] = entry
-
-            open_trade["breakeven"] = True
-
-            log(
-                "LONG moved to breakeven."
-            )
-
-        # Trailing after +1.5R
-        if (
-            high >= (
-                entry +
-                1.5 * risk
-            )
-        ):
-
-            open_trade["trailing"] = True
-
-            trailing_stop = (
-                close -
-                ATR_TRAILING_MULTIPLIER *
-                atr
-            )
-
-            if (
-                trailing_stop >
-                open_trade["stop"]
-            ):
-
-                open_trade["stop"] = (
-                    trailing_stop
-                )
-
-        # TP
-        if high >= target:
-
-            close_trad
+        url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
+        r = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"}).json()
+        return [{"o":float(x[1]),"h":float(x[2]),"l":float(x[3]),"c":float(x[4]),"v":float(x[5])} for x in r]
+    except: return []
+
+def ema(data, period):
+    if len(data) < period: return [0]*len(data)
+    k = 2/(period+1)
+    ema_vals = [sum(data[:period])/period]
+    for p in data[period:]:
+        ema_vals.append(p*k + ema_vals[-1]*(1-k))
+    return [0]*(period-1) + ema_vals
+
+def rsi_calc(closes, period=14):
+    if len(closes) < period+1: return 50
+    gains = losses = 0
+    for i in range(1, period+1):
+        d = closes[-i] - closes[-i-1]
+        if d>0: gains+=d
+        else: losses-=d
+    if losses==0: return 70
+    return 100 - (100/(1+gains/losses))
+
+def atr_calc(klines, period=14):
+    if len(klines) < period+1: return 0
+    trs=[]
+    for i in range(1,len(klines)):
+        h,l,pc = klines[i]["h"], klines[i]["l"], klines[i-1]["c"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    return sum(trs[-period:])/period
+
+def adx_calc(klines, period=14):
+    if len(klines) < period*2: return 15
+    ups, downs = [], []
+    for i in range(1,len(klines)):
+        up = klines[i]["h"] - klines[i-1]["h"]
+        down = klines[i-1]["l"] - klines[i]["l"]
+        ups.append(up if up>down and up>0 else 0)
+        downs.append(down if down>up and down>0 else 0)
+    tr = atr_calc(klines, period)
+    if tr==0: return 15
+    plus = sum(ups[-period:])/period / tr *100
+    minus = sum(downs[-period:])/period / tr *100
+    return abs(plus-minus)/(plus+minus)*100 if (plus+minus)!=0 else 15
+
+def bot_loop():
+    global balance, position, trades_today, consec_losses, daily_loss, last_trade_date, cooldown, last_signal, score_breakdown, current_price, indicators
+    while True:
+        try:
+            if date.today()!=last_trade_date:
+                trades_today=0; daily_loss=0.0; consec_losses=0; last_trade_date=date.today()
+
+            k5 = get_klines("5m",120)
+            k15 = get_klines("15m",120)
+            if not k5 or not k15:
+                time.sleep(20); continue
+
+            c5=[k["c"] for k in k5]
+            c15=[k["c"] for k in k15]
+            v5=[k["v"] for k in k5]
+            current_price=c5[-1]
+
+            ema50_15=ema(c15,50); ema200_15=ema(c15,200); adx15=adx_calc(k15,14)
+            ema20_5=ema(c5,20); ema50_5=ema(c5,50)
+            rsi5=rsi_calc(c5,14); atr5=atr_calc(k5,14)
+            vol_sma20=sum(v5[-20:])/20
+
+            indicators={"15M EMA50":ema50_15[-1],"15M EMA200":ema200_15[-1],"15M ADX":adx15,"5M EMA20":ema20_5[-1],"5M EMA50":ema50_5[-1],"5M RSI":rsi5,"5M ATR":atr5,"Vol":v5[-1],"VolSMA":vol_sma20}
+
+            long_regime = c15[-1] > ema200_15[-1] and ema50_15[-1] > ema200_15[-1] and adx15 > 18 and ema50_15[-1] > ema50_15[-2]
+            short_regime = c15[-1] < ema200_15[-1] and ema50_15[-1] < ema200_15[-1] and adx15 > 18 and ema50_15[-1] < ema50_15[-2]
+
+            # Manage position
+            if position:
+                entry=position["entry"]; risk=abs(entry-position["sl"])
+                r_mult=(current_price-entry)/risk if position["side"]=="LONG" else (entry-current_price)/risk
+                if r_mult>=1 and not position["be_done"]:
+                    position["sl"]=entry; position["be_done"]=True
+                if r_mult>=1.5:
+                    trail=1.0*atr5
+                    if position["side"]=="LONG": position["sl"]=max(position["sl"], current_price-trail)
+                    else: position["sl"]=min(position["sl"], current_price+trail)
+                hit_tp = current_price>=position["tp"] if position["side"]=="LONG" else current_price<=position["tp"]
+                hit_sl = current_price<=position["sl"] if position["side"]=="LONG" else current_price>=position["sl"]
+                if hit_tp or hit_sl or r_mult>=2.0:
+                    pnl=(current_price-entry)*position["qty"] if position["side"]=="LONG" else (entry-current_price)*position["qty"]
+                    balance+=pnl
+                    is_win=pnl>0
+                    r=2.0 if hit_tp else -1.0 if hit_sl else r_mult
+                    trade_history.append(f"{datetime.now().strftime('%H:%M')} {position['side']} {'WIN' if is_win else 'LOSS'} {r:+.1f}R ${pnl:+.2f} Bal ${balance:.2f}")
+                    if is_win: consec_losses=0
+                    else: consec_losses+=1; cooldown=COOLDOWN_CANDLES; daily_loss+=abs(pnl) if pnl<0 else 0
+                    trades_today+=1; position=None; last_signal=f"Closed {r:+.1f}R"
+
+            if position is None:
+                if adx15<18: last_signal=f"NO-TRADE ADX {adx15:.1f}<18"
+                elif v5[-1] < 0.8*vol_sma20: last_signal=f"NO-TRADE Low Vol"
+                elif trades_today>=MAX_TRADES_DAY or consec_losses>=MAX_CONSEC_LOSS or daily_loss>=initial_balance*MAX_DAILY_LOSS_PCT:
+                    last_signal=f"HALT Trades{trades_today}/4 Loss{consec_losses}/3 Dly${daily_loss:.1f}"
+                elif cooldown>0:
+                    last_signal=f"COOLDOWN {cooldown} candles"; cooldown-=1
+                else:
+                    if long_regime:
+                        score=0; reasons=[]
+                        score+=2; reasons.append("TrendBull")
+                        if ema20_5[-1]>ema50_5[-1]: score+=1; reasons.append("EMA20>50")
+                        pullback = abs(c5[-1]-ema20_5[-1]) <= 1.0*atr5 or (k5[-1]["l"] <= ema20_5[-1] <= k5[-1]["h"])
+                        if pullback: score+=1; reasons.append("Pullback")
+                        if 45 <= rsi5 <= 65: score+=1; reasons.append(f"RSI{int(rsi5)}")
+                        if v5[-1] > vol_sma20*1.05: score+=1; reasons.append("Vol")
+                        if k5[-1]["l"] > k5[-2]["l"]: score+=2; reasons.append("HigherLow");
+                        if k5[-1]["h"] > k5[-2]["h"] and k5[-1]["c"]>k5[-1]["o"]: score+=1; reasons.append("BreakHigh")
+                        extended = (c5[-1]-ema20_5[-1]) > 1.5*atr5
+                        if not extended and score>=7 and k5[-1]["c"]>k5[-1]["o"]:
+                            entry=c5[-1]; sl=entry-ATR_SL_MULT*atr5; risk=abs(entry-sl); tp=entry+2*risk
+                            qty=(balance*RISK_PCT)/risk
+                            position={"side":"LONG","entry":entry,"sl":sl,"tp":tp,"qty":qty,"be_done":False}
+                            last_signal=f"LONG Entry {entry:.2f} SL {sl:.2f} TP {tp:.2f} Score {score}/9"
+                            score_breakdown=f"{score}/9: {', '.join(reasons)} | ADX {adx15:.1f}"
+                            trade_history.append(f"{datetime.now().strftime('%H:%M')} SIGNAL LONG {score}/9 @ {entry:.2f}")
+                        else:
+                            last_signal=f"Scan LONG {score}/9 need 7 - {', '.join(reasons)} {'EXT' if extended else ''}"
+                            score_breakdown=f"ADX {adx15:.1f} RSI {rsi5:.1f} ATR {atr5:.2f}"
+                    elif short_regime:
+                        score=0; reasons=[]
+                        score+=2; reasons.append("TrendBear")
+                        if ema20_5[-1]<ema50_5[-1]: score+=1; reasons.append("EMA20<50")
+                        pullback = abs(c5[-1]-ema20_5[-1]) <= 1.0*atr5
+                        if pullback: score+=1; reasons.append("Pullback")
+                        if 35 <= rsi5 <= 55: score+=1; reasons.append(f"RSI{int(rsi5)}")
+                        if v5[-1] > vol_sma20*1.05: score+=1; reasons.append("Vol")
+                        if k5[-1]["h"] < k5[-2]["h"]: score+=2; reasons.append("LowerHigh")
+                        if k5[-1]["l"] < k5[-2]["l"] and k5[-1]["c"]<k5[-1]["o"]: score+=1; reasons.append("BreakLow")
+                        extended = (ema20_5[-1]-c5[-1]) > 1.5*atr5
+                        if not extended and score>=7 and k5[-1]["c"]<k5[-1]["o"]:
+                            entry=c5[-1]; sl=entry+ATR_SL_MULT*atr5; risk=abs(entry-sl); tp=entry-2*risk
+                            qty=(balance*RISK_PCT)/risk
+                            position={"side":"SHORT","entry":entry,"sl":sl,"tp":tp,"qty":qty,"be_done":False}
+                            last_signal=f"SHORT Entry {entry:.2f} SL {sl:.2f} TP {tp:.2f} Score {score}/9"
+                            score_breakdown=f"{score}/9: {', '.join(reasons)}"
+                        else:
+                            last_signal=f"Scan SHORT {score}/9 need 7 - {', '.join(reasons)}"
+                    else:
+                        last_signal=f"No regime ADX {adx15:.1f} EMA50 {ema50_15[-1]:.0f} EMA200 {ema200_15[-1]:.0f}"
+
+            time.sleep(20)
+        except Exception as e:
+            last_signal=f"Error {e}"; time.sleep(20)
+
+@app.route('/')
+def dash():
+    pos_txt="None"
+    if position:
+        risk=abs(position["entry"]-position["sl"]) if position["sl"]!=position["entry"] else abs(position["entry"]-position["tp"])/2
+        cur_r=(current_price-position["entry"])/risk if position["side"]=="LONG" else (position["entry"]-current_price)/risk
+        pos_txt=f"{position['side']} Entry {position['entry']:.2f} SL {position['sl']:.2f} TP {position['tp']:.2f} | {cur_r:+.2f}R"
+    return f"""
+    <html><head><meta http-equiv="refresh" content="15"><style>
+    body{{font-family:Arial;background:#0f172a;color:white;padding:12px;font-size:13px}}
+   .card{{background:#1e293b;padding:12px;border-radius:10px;margin:8px auto;max-width:500px}}
+   .price{{font-size:22px;color:#22c55e;text-align:center;font-weight:bold}}
+    </style></head><body>
+    <h2 style="text-align:center">🤖 BTC Adaptive Trend-Pullback v2</h2>
+    <div class="card"><div class="price">${current_price:.2f} RSI {indicators.get('5M RSI',0):.1f}</div>
+    15M EMA50 {indicators.get('15M EMA50',0):.0f} EMA200 {indicators.get('15M EMA200',0):.0f} ADX {indicators.get('15M ADX',0):.1f}<br>
+    5M EMA20 {indicators.get('5M EMA20',0):.0f} EMA50 {indicators.get('5M EMA50',0):.0f} ATR {indicators.get('5M ATR',0):.2f}
+    </div>
+    <div class="card"><b>PAPER</b> Bal ${balance:.2f} {(balance-initial_balance)/initial_balance*100:+.2f}%<br>
+    Position: {pos_txt}<br>Today: {trades_today}/4 | ConsecLoss {consec_losses}/3 | DlyLoss ${daily_loss:.2f} Cooldown {cooldown}<br><br>
+    <b>Signal:</b> {last_signal}<br><b>Score:</b> {score_breakdown}</div>
+    <div class="card"><b>History</b><br>{"<br>".join(trade_history[-10:][::-1]) if trade_history else "Scanning pullbacks..."}</div>
+    <div class="card" style="font-size:11px;opacity:0.7">Risk 0.5% SL 1.2 ATR TP 2R | BE +1R | Trail 1 ATR at +1.5R | Score >=7/9</div>
+    </body></html>
+    """
+
+threading.Thread(target=bot_loop, daemon=True).start()
+
+if __name__=="__main__":
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT",10000)))
