@@ -20,18 +20,21 @@ consec_losses = 0
 daily_loss = 0.0
 last_trade_date = date.today()
 cooldown = 0
-last_signal = "Starting..."
+last_signal = "Starting... fetching data"
 score_breakdown = ""
 current_price = 0.0
 indicators = {}
 trade_history = []
 
 def get_klines(interval, limit=100):
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
-        r = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"}).json()
-        return [{"o":float(x[1]),"h":float(x[2]),"l":float(x[3]),"c":float(x[4]),"v":float(x[5])} for x in r]
-    except: return []
+    for base in ["https://api.binance.com", "https://data-api.binance.vision", "https://api1.binance.com", "https://api2.binance.com"]:
+        try:
+            url = f"{base}/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
+            r = requests.get(url, timeout=8, headers={"User-Agent":"Mozilla/5.0"}).json()
+            if isinstance(r, list) and len(r) > 20:
+                return [{"o":float(x[1]),"h":float(x[2]),"l":float(x[3]),"c":float(x[4]),"v":float(x[5])} for x in r]
+        except: continue
+    return []
 
 def ema(data, period):
     if len(data) < period: return [0]*len(data)
@@ -83,26 +86,24 @@ def bot_loop():
             k5 = get_klines("5m",120)
             k15 = get_klines("15m",120)
             if not k5 or not k15:
-                time.sleep(20); continue
+                last_signal = f"Retrying Binance... 5m:{len(k5)} 15m:{len(k15)}"
+                time.sleep(10); continue
 
-            c5=[k["c"] for k in k5]
-            c15=[k["c"] for k in k15]
-            v5=[k["v"] for k in k5]
+            c5=[k["c"] for k in k5]; c15=[k["c"] for k in k15]; v5=[k["v"] for k in k5]
             current_price=c5[-1]
 
             ema50_15=ema(c15,50); ema200_15=ema(c15,200); adx15=adx_calc(k15,14)
             ema20_5=ema(c5,20); ema50_5=ema(c5,50)
             rsi5=rsi_calc(c5,14); atr5=atr_calc(k5,14)
-            vol_sma20=sum(v5[-20:])/20
+            vol_sma20=sum(v5[-20:])/20 if len(v5)>=20 else v5[-1]
 
             indicators={"15M EMA50":ema50_15[-1],"15M EMA200":ema200_15[-1],"15M ADX":adx15,"5M EMA20":ema20_5[-1],"5M EMA50":ema50_5[-1],"5M RSI":rsi5,"5M ATR":atr5,"Vol":v5[-1],"VolSMA":vol_sma20}
 
             long_regime = c15[-1] > ema200_15[-1] and ema50_15[-1] > ema200_15[-1] and adx15 > 18 and ema50_15[-1] > ema50_15[-2]
             short_regime = c15[-1] < ema200_15[-1] and ema50_15[-1] < ema200_15[-1] and adx15 > 18 and ema50_15[-1] < ema50_15[-2]
 
-            # Manage position
             if position:
-                entry=position["entry"]; risk=abs(entry-position["sl"])
+                entry=position["entry"]; risk=abs(entry-position["sl"]) if position["sl"]!=position["entry"] else atr5*1.2
                 r_mult=(current_price-entry)/risk if position["side"]=="LONG" else (entry-current_price)/risk
                 if r_mult>=1 and not position["be_done"]:
                     position["sl"]=entry; position["be_done"]=True
@@ -114,96 +115,86 @@ def bot_loop():
                 hit_sl = current_price<=position["sl"] if position["side"]=="LONG" else current_price>=position["sl"]
                 if hit_tp or hit_sl or r_mult>=2.0:
                     pnl=(current_price-entry)*position["qty"] if position["side"]=="LONG" else (entry-current_price)*position["qty"]
-                    balance+=pnl
-                    is_win=pnl>0
-                    r=2.0 if hit_tp else -1.0 if hit_sl else r_mult
-                    trade_history.append(f"{datetime.now().strftime('%H:%M')} {position['side']} {'WIN' if is_win else 'LOSS'} {r:+.1f}R ${pnl:+.2f} Bal ${balance:.2f}")
+                    balance+=pnl; is_win=pnl>0; r=2.0 if hit_tp else -1.0 if hit_sl else r_mult
+                    trade_history.append(f"{datetime.now().strftime('%H:%M')} {position['side']} {'WIN' if is_win else 'LOSS'} {r:+.1f}R ${pnl:+.2f}")
                     if is_win: consec_losses=0
                     else: consec_losses+=1; cooldown=COOLDOWN_CANDLES; daily_loss+=abs(pnl) if pnl<0 else 0
-                    trades_today+=1; position=None; last_signal=f"Closed {r:+.1f}R"
+                    trades_today+=1; position=None
 
             if position is None:
                 if adx15<18: last_signal=f"NO-TRADE ADX {adx15:.1f}<18"
-                elif v5[-1] < 0.8*vol_sma20: last_signal=f"NO-TRADE Low Vol"
+                elif v5[-1] < 0.8*vol_sma20: last_signal=f"Low Vol wait"
                 elif trades_today>=MAX_TRADES_DAY or consec_losses>=MAX_CONSEC_LOSS or daily_loss>=initial_balance*MAX_DAILY_LOSS_PCT:
-                    last_signal=f"HALT Trades{trades_today}/4 Loss{consec_losses}/3 Dly${daily_loss:.1f}"
+                    last_signal=f"HALT {trades_today}/4 trades {consec_losses}/3 losses"
                 elif cooldown>0:
-                    last_signal=f"COOLDOWN {cooldown} candles"; cooldown-=1
+                    last_signal=f"COOLDOWN {cooldown}"; cooldown-=1
                 else:
                     if long_regime:
                         score=0; reasons=[]
                         score+=2; reasons.append("TrendBull")
                         if ema20_5[-1]>ema50_5[-1]: score+=1; reasons.append("EMA20>50")
-                        pullback = abs(c5[-1]-ema20_5[-1]) <= 1.0*atr5 or (k5[-1]["l"] <= ema20_5[-1] <= k5[-1]["h"])
+                        pullback = abs(c5[-1]-ema20_5[-1]) <= 1.0*atr5
                         if pullback: score+=1; reasons.append("Pullback")
                         if 45 <= rsi5 <= 65: score+=1; reasons.append(f"RSI{int(rsi5)}")
                         if v5[-1] > vol_sma20*1.05: score+=1; reasons.append("Vol")
-                        if k5[-1]["l"] > k5[-2]["l"]: score+=2; reasons.append("HigherLow");
+                        if k5[-1]["l"] > k5[-2]["l"]: score+=2; reasons.append("HigherLow")
                         if k5[-1]["h"] > k5[-2]["h"] and k5[-1]["c"]>k5[-1]["o"]: score+=1; reasons.append("BreakHigh")
                         extended = (c5[-1]-ema20_5[-1]) > 1.5*atr5
                         if not extended and score>=7 and k5[-1]["c"]>k5[-1]["o"]:
-                            entry=c5[-1]; sl=entry-ATR_SL_MULT*atr5; risk=abs(entry-sl); tp=entry+2*risk
-                            qty=(balance*RISK_PCT)/risk
+                            entry=c5[-1]; sl=entry-1.2*atr5; risk=abs(entry-sl); tp=entry+2*risk; qty=(balance*0.005)/risk
                             position={"side":"LONG","entry":entry,"sl":sl,"tp":tp,"qty":qty,"be_done":False}
                             last_signal=f"LONG Entry {entry:.2f} SL {sl:.2f} TP {tp:.2f} Score {score}/9"
                             score_breakdown=f"{score}/9: {', '.join(reasons)} | ADX {adx15:.1f}"
-                            trade_history.append(f"{datetime.now().strftime('%H:%M')} SIGNAL LONG {score}/9 @ {entry:.2f}")
                         else:
-                            last_signal=f"Scan LONG {score}/9 need 7 - {', '.join(reasons)} {'EXT' if extended else ''}"
+                            last_signal=f"Scan LONG {score}/9 need 7 - {', '.join(reasons)}"
                             score_breakdown=f"ADX {adx15:.1f} RSI {rsi5:.1f} ATR {atr5:.2f}"
                     elif short_regime:
                         score=0; reasons=[]
-                        score+=2; reasons.append("TrendBear")
+                        score+=2; reasons.append("Bear")
                         if ema20_5[-1]<ema50_5[-1]: score+=1; reasons.append("EMA20<50")
-                        pullback = abs(c5[-1]-ema20_5[-1]) <= 1.0*atr5
-                        if pullback: score+=1; reasons.append("Pullback")
+                        if abs(c5[-1]-ema20_5[-1]) <= 1.0*atr5: score+=1; reasons.append("Pullback")
                         if 35 <= rsi5 <= 55: score+=1; reasons.append(f"RSI{int(rsi5)}")
                         if v5[-1] > vol_sma20*1.05: score+=1; reasons.append("Vol")
                         if k5[-1]["h"] < k5[-2]["h"]: score+=2; reasons.append("LowerHigh")
                         if k5[-1]["l"] < k5[-2]["l"] and k5[-1]["c"]<k5[-1]["o"]: score+=1; reasons.append("BreakLow")
                         extended = (ema20_5[-1]-c5[-1]) > 1.5*atr5
                         if not extended and score>=7 and k5[-1]["c"]<k5[-1]["o"]:
-                            entry=c5[-1]; sl=entry+ATR_SL_MULT*atr5; risk=abs(entry-sl); tp=entry-2*risk
-                            qty=(balance*RISK_PCT)/risk
+                            entry=c5[-1]; sl=entry+1.2*atr5; risk=abs(entry-sl); tp=entry-2*risk; qty=(balance*0.005)/risk
                             position={"side":"SHORT","entry":entry,"sl":sl,"tp":tp,"qty":qty,"be_done":False}
                             last_signal=f"SHORT Entry {entry:.2f} SL {sl:.2f} TP {tp:.2f} Score {score}/9"
                             score_breakdown=f"{score}/9: {', '.join(reasons)}"
                         else:
-                            last_signal=f"Scan SHORT {score}/9 need 7 - {', '.join(reasons)}"
+                            last_signal=f"Scan SHORT {score}/9 - {', '.join(reasons)}"
                     else:
                         last_signal=f"No regime ADX {adx15:.1f} EMA50 {ema50_15[-1]:.0f} EMA200 {ema200_15[-1]:.0f}"
 
             time.sleep(20)
         except Exception as e:
-            last_signal=f"Error {e}"; time.sleep(20)
+            last_signal=f"Error {e}"; time.sleep(10)
 
 @app.route('/')
 def dash():
     pos_txt="None"
     if position:
-        risk=abs(position["entry"]-position["sl"]) if position["sl"]!=position["entry"] else abs(position["entry"]-position["tp"])/2
+        risk=abs(position["entry"]-position["sl"]) if position["sl"]!=position["entry"] else 1
         cur_r=(current_price-position["entry"])/risk if position["side"]=="LONG" else (position["entry"]-current_price)/risk
-        pos_txt=f"{position['side']} Entry {position['entry']:.2f} SL {position['sl']:.2f} TP {position['tp']:.2f} | {cur_r:+.2f}R"
+        pos_txt=f"{position['side']} {position['entry']:.2f} SL {position['sl']:.2f} TP {position['tp']:.2f} | {cur_r:+.2f}R"
     return f"""
-    <html><head><meta http-equiv="refresh" content="15"><style>
+    <html><head><meta http-equiv="refresh" content="10"><style>
     body{{font-family:Arial;background:#0f172a;color:white;padding:12px;font-size:13px}}
-   .card{{background:#1e293b;padding:12px;border-radius:10px;margin:8px auto;max-width:500px}}
-   .price{{font-size:22px;color:#22c55e;text-align:center;font-weight:bold}}
+  .card{{background:#1e293b;padding:12px;border-radius:10px;margin:8px auto;max-width:500px}}
+  .price{{font-size:22px;color:#22c55e;text-align:center;font-weight:bold}}
     </style></head><body>
     <h2 style="text-align:center">🤖 BTC Adaptive Trend-Pullback v2</h2>
     <div class="card"><div class="price">${current_price:.2f} RSI {indicators.get('5M RSI',0):.1f}</div>
     15M EMA50 {indicators.get('15M EMA50',0):.0f} EMA200 {indicators.get('15M EMA200',0):.0f} ADX {indicators.get('15M ADX',0):.1f}<br>
-    5M EMA20 {indicators.get('5M EMA20',0):.0f} EMA50 {indicators.get('5M EMA50',0):.0f} ATR {indicators.get('5M ATR',0):.2f}
-    </div>
+    5M EMA20 {indicators.get('5M EMA20',0):.0f} EMA50 {indicators.get('5M EMA50',0):.0f} ATR {indicators.get('5M ATR',0):.2f}</div>
     <div class="card"><b>PAPER</b> Bal ${balance:.2f} {(balance-initial_balance)/initial_balance*100:+.2f}%<br>
-    Position: {pos_txt}<br>Today: {trades_today}/4 | ConsecLoss {consec_losses}/3 | DlyLoss ${daily_loss:.2f} Cooldown {cooldown}<br><br>
+    Position: {pos_txt}<br>Today: {trades_today}/4 | Loss {consec_losses}/3 | DlyLoss ${daily_loss:.2f}<br><br>
     <b>Signal:</b> {last_signal}<br><b>Score:</b> {score_breakdown}</div>
-    <div class="card"><b>History</b><br>{"<br>".join(trade_history[-10:][::-1]) if trade_history else "Scanning pullbacks..."}</div>
-    <div class="card" style="font-size:11px;opacity:0.7">Risk 0.5% SL 1.2 ATR TP 2R | BE +1R | Trail 1 ATR at +1.5R | Score >=7/9</div>
-    </body></html>
+    <div class="card"><b>History</b><br>{"<br>".join(trade_history[-10:][::-1]) if trade_history else "Scanning pullbacks..."}</div></body></html>
     """
 
 threading.Thread(target=bot_loop, daemon=True).start()
-
 if __name__=="__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",10000)))
